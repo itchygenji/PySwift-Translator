@@ -1,20 +1,21 @@
 .venv/
+venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
+htmlcov/
 build/
 dist/
 *.egg-info/
+*.whl
 .build/
+.vscode/
 .DS_Store
 
-# Built Python packages
-*.whl
-
-# Generated Swift output
+# Generated example output
 examples/*.swift
-
-# VS Code
-.vscode/

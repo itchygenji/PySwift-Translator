@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import importlib.resources
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -38,6 +37,7 @@ class SwiftEmitter(ast.NodeVisitor):
         self.scopes: list[dict[str, str]] = [dict()]
         self.function_info: dict[str, FunctionInfo] = {}
         self.class_names: set[str] = set()
+        self.class_methods: dict[str, dict[str, FunctionInfo]] = {}
         self.module_aliases: dict[str, str] = {}
         self.current_class: str | None = None
         self.current_function: str | None = None
@@ -53,17 +53,25 @@ class SwiftEmitter(ast.NodeVisitor):
     def warn(self, node: ast.AST, message: str) -> None:
         self.diagnostics.append(Diagnostic("warning", message, getattr(node, "lineno", None), getattr(node, "col_offset", None)))
 
+    def function_signature(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef, *, method: bool = False
+    ) -> FunctionInfo:
+        positional_nodes = [*node.args.posonlyargs, *node.args.args]
+        params = [a.arg for a in positional_nodes]
+        defaults: dict[str, ast.expr] = {}
+        if node.args.defaults:
+            offset = len(params) - len(node.args.defaults)
+            for name, default in zip(params[offset:], node.args.defaults):
+                defaults[name] = default
+        if method and params and params[0] in {"self", "cls"}:
+            params = params[1:]
+        return FunctionInfo(node.name, params, defaults)
+
     def pre_scan(self, tree: ast.Module) -> None:
+        # Collect imports/classes first so kind inference does not depend on
+        # source order.
         for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                params = [a.arg for a in node.args.args]
-                defaults: dict[str, ast.expr] = {}
-                if node.args.defaults:
-                    offset = len(params) - len(node.args.defaults)
-                    for name, default in zip(params[offset:], node.args.defaults):
-                        defaults[name] = default
-                self.function_info[node.name] = FunctionInfo(node.name, params, defaults)
-            elif isinstance(node, ast.ClassDef):
+            if isinstance(node, ast.ClassDef):
                 self.class_names.add(node.name)
             elif isinstance(node, ast.Import):
                 for alias in node.names:
@@ -71,6 +79,16 @@ class SwiftEmitter(ast.NodeVisitor):
             elif isinstance(node, ast.ImportFrom) and node.module:
                 for alias in node.names:
                     self.module_aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.function_info[node.name] = self.function_signature(node)
+            elif isinstance(node, ast.ClassDef):
+                methods: dict[str, FunctionInfo] = {}
+                for stmt in node.body:
+                    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        methods[stmt.name] = self.function_signature(stmt, method=True)
+                self.class_methods[node.name] = methods
 
     def emit_module(self, tree: ast.Module) -> str:
         self.pre_scan(tree)
@@ -88,19 +106,51 @@ class SwiftEmitter(ast.NodeVisitor):
             else:
                 executable.append(node)
 
+        # Python has function/module scope rather than Swift block scope. Hoist
+        # module bindings so assignments inside `if`/`for` remain visible and
+        # top-level values can be read from translated functions.
+        module_bindings = self.collect_bindings(executable)
+        for name, kind in module_bindings.items():
+            self.predeclare_binding(name, kind)
+        if module_bindings:
+            self.write()
+
         for node in definitions:
             self.visit(node)
             self.write()
 
         self.emit_worker_dispatch()
         self.write()
-        self.write("if !pySwiftHandledWorkerInvocation() {")
-        self.indent += 1
+
+        # A multiprocessing worker must execute module-level initialization
+        # before invoking its target, but must skip the conventional
+        # `if __name__ == "__main__"` body. Preserve source order for all
+        # other top-level statements.
+        self.write(
+            'let __pySwiftWorkerRequested = CommandLine.arguments.count >= 4 '
+            '&& CommandLine.arguments[1] == "--pyswift-worker"'
+        )
         if executable:
             for node in executable:
-                self.visit(node)
+                if self.is_main_guard(node):
+                    assert isinstance(node, ast.If)
+                    self.write("if !__pySwiftWorkerRequested {")
+                    self.indent += 1
+                    self.emit_body(node.body)
+                    self.indent -= 1
+                    if node.orelse:
+                        self.write("} else {")
+                        self.indent += 1
+                        self.emit_body(node.orelse)
+                        self.indent -= 1
+                    self.write("}")
+                else:
+                    self.visit(node)
         else:
             self.write("// No top-level executable statements.")
+        self.write("if __pySwiftWorkerRequested {")
+        self.indent += 1
+        self.write("_ = pySwiftHandledWorkerInvocation()")
         self.indent -= 1
         self.write("}")
         return "\n".join(self.lines).rstrip() + "\n"
@@ -110,7 +160,8 @@ class SwiftEmitter(ast.NodeVisitor):
         self.indent += 1
         self.write("guard CommandLine.arguments.count >= 4, CommandLine.arguments[1] == \"--pyswift-worker\" else { return false }")
         self.write("let target = CommandLine.arguments[2]")
-        self.write("let args = pyDecodeWorkerArgs(CommandLine.arguments[3])")
+        if self.function_info:
+            self.write("let args = pyDecodeWorkerArgs(CommandLine.arguments[3])")
         self.write("switch target {")
         self.indent += 1
         for name, info in sorted(self.function_info.items()):
@@ -152,6 +203,187 @@ class SwiftEmitter(ast.NodeVisitor):
     def next_temp(self) -> str:
         self._temp_counter += 1
         return f"__pyTmp{self._temp_counter}"
+
+    @staticmethod
+    def base_kind(kind: str | None) -> str:
+        if kind is None:
+            return "pyvalue"
+        return kind.removeprefix("optional:")
+
+    @staticmethod
+    def is_main_guard(node: ast.AST) -> bool:
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            return False
+        test = node.test
+        if len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq) or len(test.comparators) != 1:
+            return False
+        left, right = test.left, test.comparators[0]
+        return (
+            isinstance(left, ast.Name)
+            and left.id == "__name__"
+            and isinstance(right, ast.Constant)
+            and right.value == "__main__"
+        ) or (
+            isinstance(right, ast.Name)
+            and right.id == "__name__"
+            and isinstance(left, ast.Constant)
+            and left.value == "__main__"
+        )
+
+    def predeclare_binding(self, name: str, kind: str) -> None:
+        kind = self.base_kind(kind)
+        if name in self.scopes[-1]:
+            return
+        if kind == "pyvalue":
+            self.declare(name, "pyvalue")
+            self.write(f"var {name}: PyValue = .none")
+            return
+        if kind.startswith("class:"):
+            class_name = kind.split(":", 1)[1]
+            self.declare(name, f"optional:{kind}")
+            self.write(f"var {name}: {class_name}? = nil")
+            return
+        swift_types = {"file": "PyFile", "process": "PyProcess", "pool": "PyPool"}
+        if kind in swift_types:
+            self.declare(name, f"optional:{kind}")
+            self.write(f"var {name}: {swift_types[kind]}? = nil")
+            return
+        self.declare(name, "pyvalue")
+        self.write(f"var {name}: PyValue = .none")
+
+    def collect_bindings(self, body: Iterable[ast.stmt]) -> dict[str, str]:
+        outer = self
+        bindings: dict[str, str] = {}
+
+        def merge(name: str, kind: str) -> None:
+            kind = outer.base_kind(kind)
+            previous = bindings.get(name)
+            if previous is None or previous == kind:
+                bindings[name] = kind
+            elif previous == "pyvalue" and kind == "pyvalue":
+                bindings[name] = "pyvalue"
+            else:
+                # Rebinding between a PyValue and a reference type needs a
+                # wider boxed representation. Keep the first type in v0.1 and
+                # let compilation/tests expose incompatible programs.
+                bindings[name] = previous
+
+        def add_target(target: ast.AST, kind: str = "pyvalue") -> None:
+            if isinstance(target, ast.Name):
+                merge(target.id, kind)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for elt in target.elts:
+                    add_target(elt, "pyvalue")
+
+        class BindingScanner(ast.NodeVisitor):
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                return
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                return
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                return
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                return
+
+            def visit_Assign(self, node: ast.Assign) -> None:
+                kind = outer.infer_kind(node.value)
+                for target in node.targets:
+                    add_target(target, kind)
+                self.visit(node.value)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                add_target(node.target, outer.infer_kind(node.value))
+                if node.value is not None:
+                    self.visit(node.value)
+
+            def visit_AugAssign(self, node: ast.AugAssign) -> None:
+                add_target(node.target, "pyvalue")
+                self.visit(node.value)
+
+            def visit_For(self, node: ast.For) -> None:
+                add_target(node.target, "pyvalue")
+                self.visit(node.iter)
+                for stmt in [*node.body, *node.orelse]:
+                    self.visit(stmt)
+
+            def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+                add_target(node.target, "pyvalue")
+                for stmt in [*node.body, *node.orelse]:
+                    self.visit(stmt)
+
+            def visit_With(self, node: ast.With) -> None:
+                for item in node.items:
+                    if item.optional_vars is not None:
+                        kind = "pyvalue"
+                        if isinstance(item.context_expr, ast.Call):
+                            if (
+                                isinstance(item.context_expr.func, ast.Name)
+                                and item.context_expr.func.id == "open"
+                            ):
+                                kind = "file"
+                            elif outer.is_pool_call(item.context_expr):
+                                kind = "pool"
+                        add_target(item.optional_vars, kind)
+                    self.visit(item.context_expr)
+                for stmt in node.body:
+                    self.visit(stmt)
+
+        scanner = BindingScanner()
+        for stmt in body:
+            scanner.visit(stmt)
+        return bindings
+
+    @staticmethod
+    def collect_global_names(body: Iterable[ast.stmt]) -> set[str]:
+        names: set[str] = set()
+
+        class GlobalScanner(ast.NodeVisitor):
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                return
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                return
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                return
+
+            def visit_Global(self, node: ast.Global) -> None:
+                names.update(node.names)
+
+        scanner = GlobalScanner()
+        for stmt in body:
+            scanner.visit(stmt)
+        return names
+
+    @staticmethod
+    def swift_string_content(value: str) -> str:
+        out: list[str] = []
+        for ch in value:
+            code = ord(ch)
+            if ch == "\\":
+                out.append("\\\\")
+            elif ch == '"':
+                out.append('\\"')
+            elif ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            elif ch == "\0":
+                out.append("\\0")
+            elif code < 0x20 or code == 0x7F:
+                out.append(f"\\u{{{code:X}}}")
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    @classmethod
+    def swift_string_literal(cls, value: str) -> str:
+        return f'"{cls.swift_string_content(value)}"'
 
     # ---------- statements ----------
     def visit_Import(self, node: ast.Import) -> None:
@@ -295,25 +527,47 @@ class SwiftEmitter(ast.NodeVisitor):
     def visit_Break(self, node: ast.Break) -> None: self.write("break")
     def visit_Continue(self, node: ast.Continue) -> None: self.write("continue")
     def visit_Pass(self, node: ast.Pass) -> None: self.write("// pass")
+    def visit_Global(self, node: ast.Global) -> None: self.write("// Python global declaration")
+
+    def visit_Nonlocal(self, node: ast.Nonlocal) -> None:
+        self.error(node, "nonlocal is not yet supported")
+        self.write("// TODO(PySwift): nonlocal declaration")
+
+    def visit_Assert(self, node: ast.Assert) -> None:
+        self.error(node, "assert requires Python exception semantics and is not yet supported")
+        self.write("// TODO(PySwift): untranslated assert")
+
+    def generic_visit(self, node: ast.AST) -> None:
+        if isinstance(node, ast.stmt):
+            self.error(node, f"Unsupported statement: {type(node).__name__}")
+            self.write(f"// TODO(PySwift): unsupported {type(node).__name__}")
+            return
+        super().generic_visit(node)
 
     def visit_Return(self, node: ast.Return) -> None:
         self.write(f"return {self.expr(node.value) if node.value else '.none'}")
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         if node.decorator_list:
-            unsupported = [d for d in node.decorator_list if not (isinstance(d, ast.Name) and d.id in {"staticmethod", "classmethod"})]
+            unsupported = [
+                d
+                for d in node.decorator_list
+                if not (isinstance(d, ast.Name) and d.id in {"staticmethod", "classmethod"})
+            ]
             if unsupported:
                 self.warn(node, "Function decorators are not preserved")
         old_function = self.current_function
         self.current_function = node.name
         self.push_scope()
         params = []
-        positional = node.args.args
+        positional = [*node.args.posonlyargs, *node.args.args]
         defaults = node.args.defaults
         default_offset = len(positional) - len(defaults)
+        parameter_names: set[str] = set()
         for i, arg in enumerate(positional):
             if self.current_class and arg.arg in {"self", "cls"}:
                 continue
+            parameter_names.add(arg.arg)
             self.declare(arg.arg)
             if i >= default_offset:
                 default = self.expr(defaults[i - default_offset])
@@ -328,12 +582,28 @@ class SwiftEmitter(ast.NodeVisitor):
         if self.current_class and name == "__init__":
             self.write(f"init({', '.join(params)}) {{")
         else:
-            swift_name = name
-            self.write(f"func {swift_name}({', '.join(params)}) -> PyValue {{")
+            self.write(f"func {name}({', '.join(params)}) -> PyValue {{")
         self.indent += 1
         body = node.body
-        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
-            self.visit(body[0]); body = body[1:]
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            self.visit(body[0])
+            body = body[1:]
+
+        global_names = self.collect_global_names(body)
+        local_bindings = self.collect_bindings(body)
+        declared_locals = False
+        for local_name, kind in local_bindings.items():
+            if local_name not in parameter_names and local_name not in global_names:
+                self.predeclare_binding(local_name, kind)
+                declared_locals = True
+        if declared_locals:
+            self.write()
+
         self.emit_body(body)
         if not (self.current_class and name == "__init__") and not self.body_always_returns(body):
             self.write("return .none")
@@ -451,10 +721,10 @@ class SwiftEmitter(ast.NodeVisitor):
         if isinstance(v, bool): return f".bool({str(v).lower()})"
         if isinstance(v, int): return f".int({v})"
         if isinstance(v, float): return f".double({repr(v)})"
-        if isinstance(v, str): return f".string({json.dumps(v)})"
+        if isinstance(v, str): return f".string({self.swift_string_literal(v)})"
         if isinstance(v, bytes):
             self.warn(node, "bytes are lowered to a UTF-8 string")
-            return f".string({json.dumps(v.decode('utf-8', errors='replace'))})"
+            return f".string({self.swift_string_literal(v.decode('utf-8', errors='replace'))})"
         self.error(node, f"Unsupported constant: {type(v).__name__}")
         return ".none"
 
@@ -463,6 +733,9 @@ class SwiftEmitter(ast.NodeVisitor):
         if node.id == "False": return ".bool(false)"
         if node.id == "None": return ".none"
         if node.id == "__name__": return '.string("__main__")'
+        kind = self.resolve(node.id)
+        if kind and kind.startswith("optional:"):
+            return f"{node.id}!"
         return node.id
 
     def expr_List(self, node: ast.List) -> str: return ".list([" + ", ".join(self.expr(e) for e in node.elts) + "])"
@@ -477,8 +750,11 @@ class SwiftEmitter(ast.NodeVisitor):
             if k is None:
                 self.error(node, "Dictionary **unpacking is not supported")
                 continue
-            key = self.expr(k)
-            pairs.append(f"{key}.stringValue: {self.expr(v)}")
+            if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                key = self.swift_string_literal(k.value)
+            else:
+                key = f"{self.expr(k)}.stringValue"
+            pairs.append(f"{key}: {self.expr(v)}")
         return ".dict([" + ", ".join(pairs) + "])"
 
     def expr_BinOp(self, node: ast.BinOp) -> str: return self.binop(node.op, self.expr(node.left), self.expr(node.right))
@@ -570,8 +846,8 @@ class SwiftEmitter(ast.NodeVisitor):
             if name == "print":
                 sep = '" "'; end = '"\\n"'
                 for kw in node.keywords:
-                    if kw.arg == "sep": sep = f"{self.expr(kw.value)}.stringValue"
-                    elif kw.arg == "end": end = f"{self.expr(kw.value)}.stringValue"
+                    if kw.arg == "sep": sep = f"({self.expr(kw.value)} as PyValue).stringValue"
+                    elif kw.arg == "end": end = f"({self.expr(kw.value)} as PyValue).stringValue"
                     else: self.warn(kw, f"print keyword '{kw.arg}' is ignored")
                 return f"pyPrint([{', '.join(self.expr(a) for a in node.args)}], sep: {sep}, end: {end})"
             if name == "len": return f"pyLen({self.one_arg(node, name)})"
@@ -615,7 +891,10 @@ class SwiftEmitter(ast.NodeVisitor):
                     if kw.arg == "mode": mode = self.expr(kw.value)
                 return f"PyFile({args[0] if args else '.string(\"\")'}, mode: {mode})"
             if name in self.class_names:
-                return f"{name}({', '.join(self.expr(a) for a in node.args)})"
+                info = self.class_methods.get(name, {}).get(
+                    "__init__", FunctionInfo("__init__", [], {})
+                )
+                return f"{name}({self.render_known_args(name, info, node)})"
             if name in self.function_info:
                 return self.user_function_call(name, node)
             imported = self.module_aliases.get(name)
@@ -643,7 +922,15 @@ class SwiftEmitter(ast.NodeVisitor):
             if method == "pop": return f"{recv_expr}.pyPop({self.expr(node.args[0]) if node.args else ''})"
             if method == "remove": return f"{recv_expr}.pyRemove({self.one_arg(node, method)})"
             if method == "reverse": return f"{recv_expr}.pyReverse()"
-            if method == "sort": return f"{recv_expr}.pySort()"
+            if method == "sort":
+                reverse = ".bool(false)"
+                for kw in node.keywords:
+                    if kw.arg == "reverse": reverse = self.expr(kw.value)
+                    elif kw.arg == "key": self.warn(kw, "list.sort(key=...) is not yet preserved")
+                    else: self.error(kw, f"Unexpected keyword '{kw.arg}' in list.sort")
+                if node.args:
+                    self.error(node, "list.sort() positional arguments are not supported")
+                return f"{recv_expr}.pySort(reverse: {reverse})"
             if method == "keys": return f"{recv_expr}.pyKeys()"
             if method == "values": return f"{recv_expr}.pyValues()"
             if method == "items": return f"{recv_expr}.pyItems()"
@@ -668,30 +955,56 @@ class SwiftEmitter(ast.NodeVisitor):
             if recv_kind == "pool" and method in {"close", "join"}: return f"{recv_expr}.{method}()"
             if recv_kind == "file" and method in {"read", "readline", "close"}: return f"{recv_expr}.{method}()"
             if recv_kind == "file" and method == "write": return f"{recv_expr}.write({self.one_arg(node, method)})"
-            # Class methods and unknown methods.
+            if recv_kind.startswith("class:"):
+                class_name = recv_kind.split(":", 1)[1]
+                info = self.class_methods.get(class_name, {}).get(method)
+                if info is not None:
+                    rendered = self.render_known_args(f"{class_name}.{method}", info, node)
+                    return f"{recv_expr}.{method}({rendered})"
+            # Unknown methods cannot safely discard Python keyword arguments.
+            if node.keywords:
+                self.error(
+                    node,
+                    f"Keyword arguments on unknown method '{method}' cannot be translated safely",
+                )
             return f"{recv_expr}.{method}({', '.join(self.expr(a) for a in node.args)})"
 
         self.error(node, "Unsupported callable expression")
         return ".none"
 
-    def user_function_call(self, name: str, node: ast.Call) -> str:
-        info = self.function_info[name]
+    def render_known_args(self, display_name: str, info: FunctionInfo, node: ast.Call) -> str:
         positional = [self.expr(a) for a in node.args]
         values: dict[str, str] = {}
-        for param, value in zip(info.params, positional): values[param] = value
+        if len(positional) > len(info.params):
+            self.error(node, f"Too many positional arguments in call to {display_name}")
+        for param, value in zip(info.params, positional):
+            values[param] = value
         for kw in node.keywords:
             if kw.arg is None:
                 self.error(node, "**kwargs call expansion is not supported")
-            else:
-                values[kw.arg] = self.expr(kw.value)
+                continue
+            if kw.arg not in info.params:
+                self.error(
+                    kw, f"Unexpected keyword argument '{kw.arg}' in call to {display_name}"
+                )
+                continue
+            if kw.arg in values:
+                self.error(kw, f"Multiple values for argument '{kw.arg}' in call to {display_name}")
+                continue
+            values[kw.arg] = self.expr(kw.value)
         rendered = []
         for param in info.params:
-            if param in values: rendered.append(values[param])
-            elif param in info.defaults: rendered.append(self.expr(info.defaults[param]))
+            if param in values:
+                rendered.append(values[param])
+            elif param in info.defaults:
+                rendered.append(self.expr(info.defaults[param]))
             else:
-                self.error(node, f"Missing required argument '{param}' in call to {name}")
+                self.error(node, f"Missing required argument '{param}' in call to {display_name}")
                 rendered.append(".none")
-        return f"{name}({', '.join(rendered)})"
+        return ", ".join(rendered)
+
+    def user_function_call(self, name: str, node: ast.Call) -> str:
+        return f"{name}({self.render_known_args(name, self.function_info[name], node)})"
 
     def one_arg(self, node: ast.Call, name: str, default: str = ".none") -> str:
         if not node.args: return default
@@ -703,12 +1016,17 @@ class SwiftEmitter(ast.NodeVisitor):
         return ".none"
 
     def expr_JoinedStr(self, node: ast.JoinedStr) -> str:
-        parts = []
+        parts: list[str] = []
         for value in node.values:
-            if isinstance(value, ast.Constant): parts.append(str(value.value))
+            if isinstance(value, ast.Constant):
+                parts.append(self.swift_string_content(str(value.value)))
             elif isinstance(value, ast.FormattedValue):
+                if value.conversion not in {-1, ord("s")} or value.format_spec is not None:
+                    self.warn(
+                        value, "f-string conversion/format specifier is only partially supported"
+                    )
                 parts.append(f"\\({self.expr(value.value)}.description)")
-        return f".string({json.dumps(''.join(parts)).replace('\\\\(', '\\(')})"
+        return f'.string("{"".join(parts)}")'
 
     def expr_ListComp(self, node: ast.ListComp) -> str:
         if len(node.generators) != 1 or not isinstance(node.generators[0].target, ast.Name):
@@ -788,7 +1106,7 @@ class SwiftEmitter(ast.NodeVisitor):
 
     def infer_kind(self, node: ast.AST | None) -> str:
         if node is None: return "pyvalue"
-        if isinstance(node, ast.Name): return self.resolve(node.id) or "pyvalue"
+        if isinstance(node, ast.Name): return self.base_kind(self.resolve(node.id))
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 if node.func.id in self.class_names: return f"class:{node.func.id}"

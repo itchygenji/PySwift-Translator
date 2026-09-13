@@ -1,46 +1,60 @@
 # PySwift Translator
 
-PySwift Translator is an AST-based Python-to-Swift source translator intended to turn practical Python programs into buildable Swift executables. It ships with a small Swift compatibility runtime so translated code can preserve Python-style dynamic values, lists, dictionaries, truthiness, slicing, common built-ins, file I/O, selected standard-library calls, and basic multiprocessing behavior.
+PySwift Translator is an AST-based Python-to-Swift source translator. It converts a documented subset of Python into buildable Swift and ships a small Swift compatibility runtime for Python-style dynamic values, collections, truthiness, slicing, common built-ins, file I/O, selected standard-library calls, and a basic `multiprocessing` subset.
 
-> **Status:** v0.1.0 alpha. It is a real, installable, tested product skeleton, but it is not a drop-in replacement for CPython. Python and Swift have different type systems, object models, exception models, module systems, metaprogramming capabilities, and concurrency semantics. Unsupported syntax is reported as a diagnostic instead of silently pretending the translation is exact.
+> **Status: v0.1.1 alpha.** This is an installable and tested compiler project, not a drop-in replacement for CPython. Unsupported or unsafe translations should produce diagnostics instead of being silently ignored. Generated Swift should still be tested against the original Python program before production use.
 
-## What it does
+## What changed in v0.1.1
 
-Given:
+The hardened release adds regression fixes and tests for several semantic issues found during differential Python-vs-Swift execution testing:
 
-```python
-import math
-
-def square(x):
-    return x * x
-
-values = [1, 2, 3, 4]
-print("sqrt:", math.sqrt(16))
-for value in values:
-    print(value, square(value))
-```
-
-PySwift generates Swift that builds as an executable and produces corresponding output.
-
-The translator uses Python's `ast` module rather than regex replacement. This makes control flow, expressions, function definitions, classes, and call structure explicit and gives the project a clean path for adding more language features.
+- Python module variables can be read from translated functions.
+- Variables assigned in `if`/`for` blocks remain visible in their Python function/module scope.
+- Negative-step slices such as `[::-1]` now behave correctly for supported sequences.
+- Negative modulo follows Python's sign rules for supported numeric values.
+- Numeric sorting is numeric instead of lexicographic; string sorting/min/max use string ordering.
+- Numeric equality now handles Python-compatible `bool`/`int`/`float` equality such as `True == 1` and `1 == 1.0`.
+- Unicode string literals and basic Unicode f-strings compile as Swift source.
+- Known function, constructor, and translated-method keyword arguments are normalized and validated.
+- Too many, duplicate, missing, and unexpected known-call arguments produce diagnostics.
+- Dictionary literals generate safer Swift syntax.
+- `json.dumps`/`json.loads` now use normal JSON values instead of the internal multiprocessing encoding.
+- `assert`, `nonlocal`, and other unsupported statements are no longer silently discarded.
+- `readline()` advances through a file instead of repeatedly returning the first line.
+- Multiprocessing workers run module-level initialization before dispatch, so supported workers can read module globals.
+- Worker stdout is drained before waiting, preventing a pipe-buffer deadlock on large worker output.
 
 ## Installation
 
-Development install:
+From a clone of this repository:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate              # Windows: .venv\\Scripts\\activate
+```
+
+Activate it:
+
+```bash
+# Windows PowerShell / cmd
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+```
+
+Then install:
+
+```bash
 pip install -e ".[dev]"
 ```
 
-Normal install from the project directory:
+For a normal local install without development dependencies:
 
 ```bash
 pip install .
 ```
 
-You also need a Swift toolchain if you want to build the generated Swift package. On macOS, install Xcode or the Swift toolchain. On Linux, install Swift from swift.org.
+A Swift toolchain is required only when you want to compile generated Swift. On macOS, Xcode/Xcode Command Line Tools provide Swift. On Linux, install a compatible Swift toolchain.
 
 ## Quick start
 
@@ -50,7 +64,7 @@ Translate one Python file:
 pyswift examples/basic.py -o basic.swift
 ```
 
-Create a single standalone Swift source file with the compatibility runtime embedded:
+Generate a single standalone Swift file with the compatibility runtime embedded:
 
 ```bash
 pyswift examples/basic.py -o basic.swift --standalone
@@ -73,11 +87,13 @@ Generate and build in one command:
 pyswift examples/basic.py --package Build/basic --build
 ```
 
-Check compatibility without writing an output file:
+Check compatibility without writing output:
 
 ```bash
 pyswift your_program.py --check
 ```
+
+The command exits nonzero when translation errors are reported.
 
 ## Python API
 
@@ -92,99 +108,96 @@ for diagnostic in result.diagnostics:
     print(diagnostic.format("example.py"))
 ```
 
-## Supported language features
+## Supported surface
 
-The compatibility surface is intentionally explicit.
+The compatibility surface is intentionally explicit. See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for the detailed table.
 
-| Python feature | Status | Notes |
-|---|---|---|
-| `print`, `input` | Supported | `sep` and `end` supported for `print` |
-| ints, floats, bools, strings, `None` | Supported | Represented by `PyValue` |
-| lists, tuples | Supported | Tuples currently lower to list-like `PyValue` storage |
-| dictionaries | Supported | Keys are string-normalized in the runtime |
-| set literals | Partial | Lowered to lists; uniqueness semantics are not preserved |
-| arithmetic | Supported | `+ - * / // % **` |
-| bitwise operators | Supported | `& | ^ << >> ~` on integer-like values |
-| comparisons | Supported | Includes chained comparisons and `in` / `not in` |
-| `and`, `or`, `not` | Supported | Preserves Python-style operand return for `and`/`or` |
-| `if` / `elif` / `else` | Supported | Uses Python-style truthiness |
-| `while` | Supported | `while...else` is only partial |
-| `for` | Supported | Iterates strings, lists, and dictionary keys |
-| `break`, `continue`, `pass` | Supported | |
-| functions | Supported | Positional/default args and many keyword calls |
-| recursion | Supported | |
-| `*args`, `**kwargs`, keyword-only defs | Not yet | Emits diagnostics |
-| f-strings | Supported | Basic interpolation |
-| indexing and slices | Supported | Common positive/negative indexing and slicing |
-| list comprehensions | Partial | One generator with a simple name target |
-| classes | Partial | Basic classes, `__init__`, instance properties, methods |
-| inheritance | Partial | Base classes currently omitted with warning |
-| decorators | Partial | Most decorators warn and are omitted |
-| `with open(...)` | Supported | Basic text read/write/append |
-| `try/except/finally` | Not yet | Explicit diagnostic; requires error-model translation |
-| `raise` | Not yet | Emits diagnostic / placeholder |
-| `async` / `await` | Partial | Currently lowered synchronously with warnings |
-| lambdas / first-class functions | Not yet | Requires callable support in `PyValue` |
-| generators / `yield` | Not yet | |
-| pattern matching | Not yet | |
+Commonly supported areas include:
 
-### Built-ins currently mapped
+- scalars: `None`, `bool`, `int`, `float`, `str`
+- lists, tuple-like storage, string-keyed dictionaries
+- arithmetic, comparisons, truthiness, boolean operators, bitwise integer operations
+- `if`/`elif`/`else`, `while`, `for`, `break`, `continue`, `pass`
+- functions with positional/default parameters and validated keyword calls
+- basic classes, constructors, instance fields, and translated method calls
+- indexing and common slices, including negative-step slices
+- basic f-strings
+- `with open(...)` text file handling
+- selected `math`, `time`, `random`, `sys`, `os`, and `json` mappings
+- a constrained `multiprocessing.Process` and `Pool.map` implementation using real child processes
 
-`print`, `input`, `len`, `int`, `float`, `str`, `bool`, `abs`, `sum`, `min`, `max`, `round`, `any`, `all`, `sorted`, `reversed`, `range`, `enumerate`, `zip`, `list`, `dict`, and `open`.
+Not yet equivalent to general CPython:
 
-### Common methods currently mapped
+- arbitrary third-party packages or C-extension modules
+- full exception semantics (`try`/`except`/`finally`, `raise`, `assert`)
+- generators/`yield`
+- arbitrary first-class functions/lambdas/callbacks
+- full inheritance/descriptors/metaclasses/decorators
+- complete `asyncio`/Swift concurrency translation
+- dynamic imports, monkey-patching, `eval`/`exec`, reflection-heavy frameworks
+- all dictionary ordering/key semantics
+- every Python numeric/error edge case
+- full multiprocessing APIs such as queues, managers, shared memory, locks, pipes, contexts, and daemon semantics
 
-Lists: `append`, `extend`, `insert`, `pop`, `remove`, `reverse`, `sort`.
+## Multiprocessing model
 
-Strings: `upper`, `lower`, `strip`, `replace`, `startswith`, `endswith`, `split`, `find`.
-
-Dictionaries: `keys`, `values`, `items`, `get`.
-
-Files: `read`, `readline`, `write`, `close`.
-
-## Standard-library mappings
-
-Current mappings include selected functionality from:
-
-- `math`: `pi`, `sqrt`, `sin`, `cos`, `tan`, `floor`, `ceil`
-- `time`: `sleep`
-- `random`: `random`, `randint`
-- `sys`: `argv`
-- `os`: `getenv`, `getcwd`, `mkdir`, `makedirs`, `path.exists`, `path.join`
-- `json`: `dumps`, `loads` for `PyValue` data
-- `multiprocessing`: `Process`, `Pool.map`
-
-Unknown imports are preserved as diagnostics rather than guessed.
-
-## Multiprocessing
-
-PySwift does **not** silently translate Python processes into threads. For the supported `multiprocessing` subset, the generated executable launches child copies of itself with a hidden worker invocation protocol.
-
-Example:
+For the supported subset, PySwift does not replace processes with threads. A translated executable launches child copies of itself with an internal worker protocol.
 
 ```python
 import multiprocessing as mp
 
+FACTOR = 3
+
 def worker(x):
-    print("worker", x)
-    return x * x
+    return x * FACTOR
 
 if __name__ == "__main__":
-    p = mp.Process(target=worker, args=(5,))
-    p.start()
-    p.join()
-
     with mp.Pool(processes=2) as pool:
-        results = pool.map(worker, [1, 2, 3, 4])
-        print(results)
+        print(pool.map(worker, [1, 2, 3]))
 ```
 
-Supported multiprocessing assumptions in v0.1:
+Supported assumptions:
 
-- Worker targets must be named top-level functions.
-- Worker arguments/results must be representable by `PyValue` and therefore JSON-serializable by the runtime.
-- `Pool.map` supports one iterable.
-- Shared memory, managers, queues, locks, pipes, custom process contexts, and daemon semantics are future work.
+- worker targets are named top-level functions;
+- arguments/results are representable by `PyValue`;
+- `Pool.map` accepts one iterable;
+- module-level initialization runs in child workers before the target is dispatched;
+- worker scheduling/output order can differ from Python while result order for `Pool.map` is preserved.
+
+## Testing
+
+Run all tests available on the current machine:
+
+```bash
+pytest
+```
+
+Run only Python-side/unit tests:
+
+```bash
+pytest -m "not swift"
+```
+
+Run only compile/execute tests that require `swiftc`:
+
+```bash
+pytest -m swift
+```
+
+The semantic regression suite does real differential execution:
+
+```text
+Python source
+   |---------------------> CPython stdout
+   |
+   +-> PySwift -> Swift -> swiftc -> executable stdout
+                                      |
+                                      +-> compare
+```
+
+The v0.1.1 working tree was locally validated with Python 3.13.5 and Swift 6.2.1. At packaging time, the suite had **20 passing tests**, including Swift compile/run tests, Python-vs-Swift output comparisons, file I/O, module globals, keyword arguments, slicing, numeric semantics, JSON, and multiprocessing. GitHub Actions is included to repeat Python tests on multiple operating systems/Python versions and the Swift integration suite on macOS after you push the changes.
+
+See [docs/TESTING.md](docs/TESTING.md) for the release checklist and test categories.
 
 ## Architecture
 
@@ -192,93 +205,47 @@ Supported multiprocessing assumptions in v0.1:
 Python source
    |
    v
-Python ast.parse()
+ast.parse()
    |
    v
 SwiftEmitter
-   |---- diagnostics for unsupported/partial constructs
+   |---- diagnostics
+   |---- scope/signature analysis
    |
-   +---- generated main.swift
-   |
-   +---- PyRuntime.swift compatibility layer
-              |
-              v
-         Swift Package / swiftc
-              |
-              v
-          native executable
+   +---- generated Swift
+             |
+             +---- PyRuntime.swift
+                       |
+                       v
+                 swiftc / SwiftPM
+                       |
+                       v
+                native executable
 ```
 
-The translator is split into three main pieces:
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-1. **Front end** — CPython's AST parser validates Python syntax and provides a structured tree.
-2. **Emitter** — `SwiftEmitter` converts supported AST nodes into Swift and tracks variable kinds needed for files, classes, and multiprocessing objects.
-3. **Compatibility runtime** — `PyValue` and helper functions preserve dynamic behavior that would otherwise be awkward or lossy in idiomatic Swift.
+## Packaging
 
-See `docs/ARCHITECTURE.md` for extension details.
-
-## Diagnostics philosophy
-
-A source translator is dangerous if it generates plausible-looking but semantically wrong code. PySwift therefore distinguishes:
-
-- `warning`: translation was produced, but behavior may not be identical.
-- `error`: construct is unsupported or cannot be translated safely.
-
-The CLI exits nonzero when translation errors exist.
-
-## Testing
-
-Run the Python unit tests:
+Build a wheel locally:
 
 ```bash
-pytest
+python -m pip wheel . --no-deps -w dist
 ```
 
-The integration tests compile generated Swift when `swiftc` is available.
-
-Manual end-to-end examples:
+For a release build when `build` and `twine` are installed:
 
 ```bash
-pyswift examples/basic.py --package /tmp/basic --build
-/tmp/basic/.build/debug/basic
-
-pyswift examples/multiprocessing_demo.py --package /tmp/mp --build
-/tmp/mp/.build/debug/multiprocessing_demo
-```
-
-## Packaging and release
-
-The repository includes modern `pyproject.toml` packaging and a console entry point. A normal release flow is:
-
-```bash
-python -m pip install --upgrade build twine
 python -m build
-twine check dist/*
+python -m twine check dist/*
 ```
 
-Before a public v1.0 release, add semantic-equivalence test corpora, macOS/Linux CI for generated Swift, fuzz tests for AST combinations, and explicit compatibility versioning for `PyRuntime.swift`.
+Do not publish a release to PyPI until the GitHub Actions test workflow is green for the commit/tag being released.
 
-## Important limitations
+## Contributing and security
 
-This project can translate a meaningful subset of Python, but no source-to-source translator can automatically make **all** Python programs equivalent Swift programs without either embedding a Python interpreter or reproducing most of Python's runtime. Features such as runtime monkey-patching, metaclasses, arbitrary descriptors, C-extension packages, dynamic imports, reflection-heavy frameworks, exception subtleties, generators, and ecosystem-specific libraries require dedicated lowering rules or a compatibility layer.
-
-For production use, treat generated Swift as generated source that must pass tests against the original Python program. The long-term product path is to grow the supported AST surface and library adapters while keeping unsupported behavior explicit.
-
-## Roadmap
-
-Near-term priorities:
-
-1. `try` / `except` / `finally` and a Python-compatible error wrapper.
-2. First-class callable `PyValue`, lambdas, callbacks, `map`/`filter`.
-3. Multi-module Python project translation and import graph handling.
-4. Better class inheritance, protocols, dataclasses, properties, and decorators.
-5. Generators and iterator protocol.
-6. `asyncio` to Swift concurrency lowering.
-7. More `multiprocessing` primitives.
-8. Pluggable standard-library / third-party package adapters.
-9. Source maps from Swift diagnostics back to Python lines.
-10. Differential Python-vs-Swift execution tests.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [LICENSE](LICENSE).

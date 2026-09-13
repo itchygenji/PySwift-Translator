@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyswift-translator"
-version = "0.1.0"
+version = "0.1.1"
 description = "AST-based Python to Swift source translator with a Swift compatibility runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -42,3 +42,8 @@ markers = ["swift: integration tests requiring a Swift toolchain"]
 
 [tool.ruff]
 line-length = 100
+
+[project.urls]
+Homepage = "https://github.com/itchygenji/PySwift-Translator"
+Repository = "https://github.com/itchygenji/PySwift-Translator"
+Issues = "https://github.com/itchygenji/PySwift-Translator/issues"
