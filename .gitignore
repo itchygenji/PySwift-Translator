@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.build/
+.DS_Store
+
+# Built Python packages
+*.whl
+
+# Generated Swift output
+examples/*.swift
+
+# VS Code
+.vscode/
