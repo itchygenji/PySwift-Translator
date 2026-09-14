@@ -35,8 +35,11 @@ python -m venv .venv
 Activate it:
 
 ```bash
-# Windows PowerShell / cmd
+# Windows PowerShell / Command Prompt
 .venv\Scripts\activate
+
+# Windows Git Bash
+source .venv/Scripts/activate
 
 # macOS / Linux
 source .venv/bin/activate
@@ -169,19 +172,19 @@ Supported assumptions:
 Run all tests available on the current machine:
 
 ```bash
-pytest
+python -m pytest
 ```
 
 Run only Python-side/unit tests:
 
 ```bash
-pytest -m "not swift"
+python -m pytest -m "not swift"
 ```
 
 Run only compile/execute tests that require `swiftc`:
 
 ```bash
-pytest -m swift
+python -m pytest -m swift
 ```
 
 The semantic regression suite does real differential execution:
@@ -195,7 +198,32 @@ Python source
                                       +-> compare
 ```
 
-The v0.1.1 working tree was locally validated with Python 3.13.5 and Swift 6.2.1. At packaging time, the suite had **20 passing tests**, including Swift compile/run tests, Python-vs-Swift output comparisons, file I/O, module globals, keyword arguments, slicing, numeric semantics, JSON, and multiprocessing. GitHub Actions is included to repeat Python tests on multiple operating systems/Python versions and the Swift integration suite on macOS after you push the changes.
+The v0.1.1 test suite currently contains 20 tests.
+
+On Windows without a Swift toolchain, the validated result is:
+
+```text
+13 passed, 7 skipped
+```
+
+The seven skipped tests require `swiftc` and perform real Swift compilation and execution. These tests are intended to run on macOS locally and through the macOS GitHub Actions runner.
+
+The current Windows development checks pass:
+
+```text
+pytest: 13 passed, 7 skipped
+ruff: All checks passed!
+mypy: Success: no issues found in 6 source files
+```
+
+The package also successfully builds both distribution formats:
+
+```text
+pyswift_translator-0.1.1-py3-none-any.whl
+pyswift_translator-0.1.1.tar.gz
+```
+
+A release should not be published to PyPI until the GitHub Actions workflow, including the macOS Swift integration tests, is green.
 
 See [docs/TESTING.md](docs/TESTING.md) for the release checklist and test categories.
 

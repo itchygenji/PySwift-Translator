@@ -547,7 +547,7 @@ class SwiftEmitter(ast.NodeVisitor):
     def visit_Return(self, node: ast.Return) -> None:
         self.write(f"return {self.expr(node.value) if node.value else '.none'}")
 
-    # def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+
     def visit_FunctionDef(
         self,
         node: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -616,18 +616,13 @@ class SwiftEmitter(ast.NodeVisitor):
         self.pop_scope()
         self.current_function = old_function
 
-    # def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-    #     self.warn(node, "async def is currently lowered to a synchronous Swift function")
-    #     clone = ast.FunctionDef(
-    #         name=node.name,
-    #         args=node.args,
-    #         body=node.body,
-    #         decorator_list=node.decorator_list,
-    #         returns=node.returns,
-    #         type_comment=node.type_comment,
-    #     )
-    #     ast.copy_location(clone, node)
-    #     self.visit_FunctionDef(clone)
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.warn(
+            node,
+            "async def is currently lowered to a synchronous Swift function",
+        )
+        self.visit_FunctionDef(node)
+        
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         if node.bases:
@@ -643,7 +638,7 @@ class SwiftEmitter(ast.NodeVisitor):
             self.write()
         had_init = False
         for stmt in node.body:
-            if isinstance(stmt, ast.FunctionDef):
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 if stmt.name == "__init__": had_init = True
                 self.visit(stmt)
                 self.write()
