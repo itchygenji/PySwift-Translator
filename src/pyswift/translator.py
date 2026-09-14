@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import ast
 import importlib.resources
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 from .diagnostics import Diagnostic
 
@@ -34,7 +34,7 @@ class SwiftEmitter(ast.NodeVisitor):
         self.lines: list[str] = []
         self.indent = 0
         self.diagnostics: list[Diagnostic] = []
-        self.scopes: list[dict[str, str]] = [dict()]
+        self.scopes: list[dict[str, str]] = [{}]
         self.function_info: dict[str, FunctionInfo] = {}
         self.class_names: set[str] = set()
         self.class_methods: dict[str, dict[str, FunctionInfo]] = {}
@@ -547,7 +547,11 @@ class SwiftEmitter(ast.NodeVisitor):
     def visit_Return(self, node: ast.Return) -> None:
         self.write(f"return {self.expr(node.value) if node.value else '.none'}")
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+    # def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+    def visit_FunctionDef(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> None:
         if node.decorator_list:
             unsupported = [
                 d
@@ -612,11 +616,18 @@ class SwiftEmitter(ast.NodeVisitor):
         self.pop_scope()
         self.current_function = old_function
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self.warn(node, "async def is currently lowered to a synchronous Swift function")
-        clone = ast.FunctionDef(node.name, node.args, node.body, node.decorator_list, node.returns, node.type_comment)
-        ast.copy_location(clone, node)
-        self.visit_FunctionDef(clone)
+    # def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+    #     self.warn(node, "async def is currently lowered to a synchronous Swift function")
+    #     clone = ast.FunctionDef(
+    #         name=node.name,
+    #         args=node.args,
+    #         body=node.body,
+    #         decorator_list=node.decorator_list,
+    #         returns=node.returns,
+    #         type_comment=node.type_comment,
+    #     )
+    #     ast.copy_location(clone, node)
+    #     self.visit_FunctionDef(clone)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         if node.bases:
@@ -668,7 +679,11 @@ class SwiftEmitter(ast.NodeVisitor):
             self.indent -= 1
             self.write("}")
             return
-        if self.is_pool_call(item.context_expr) and isinstance(item.optional_vars, ast.Name):
+        if (
+            isinstance(item.context_expr, ast.Call)
+            and self.is_pool_call(item.context_expr)
+            and isinstance(item.optional_vars, ast.Name)
+        ):
             self.write("do {")
             self.indent += 1
             self.declare(item.optional_vars.id, "pool")
@@ -720,7 +735,7 @@ class SwiftEmitter(ast.NodeVisitor):
         if v is None: return ".none"
         if isinstance(v, bool): return f".bool({str(v).lower()})"
         if isinstance(v, int): return f".int({v})"
-        if isinstance(v, float): return f".double({repr(v)})"
+        if isinstance(v, float): return f".double({v!r})"
         if isinstance(v, str): return f".string({self.swift_string_literal(v)})"
         if isinstance(v, bytes):
             self.warn(node, "bytes are lowered to a UTF-8 string")
@@ -853,7 +868,9 @@ class SwiftEmitter(ast.NodeVisitor):
             if name == "len": return f"pyLen({self.one_arg(node, name)})"
             if name == "int": return f"pyInt({self.one_arg(node, name, '.int(0)')})"
             if name == "float": return f"pyFloat({self.one_arg(node, name, '.double(0)')})"
-            if name == "str": return f"pyStr({self.one_arg(node, name, '.string(\"\")')})"
+            if name == "str":
+                value = self.one_arg(node, name, '.string("")')
+                return f"pyStr({value})"
             if name == "bool": return f"pyBool({self.one_arg(node, name, '.bool(false)')})"
             if name == "abs": return f"pyAbs({self.one_arg(node, name)})"
             if name == "sum": return f"pySum({self.one_arg(node, name)})"
@@ -871,7 +888,9 @@ class SwiftEmitter(ast.NodeVisitor):
             if name == "round":
                 args = [self.expr(a) for a in node.args]
                 return f"pyRound({args[0] if args else '.none'}{', ' + args[1] if len(args) > 1 else ''})"
-            if name == "input": return f"pyInput({self.expr(node.args[0]) if node.args else '.string(\"\")'})"
+            if name == "input":
+                value = self.expr(node.args[0]) if node.args else '.string("")'
+                return f"pyInput({value})"
             if name == "range":
                 args = [self.expr(a) for a in node.args]
                 if len(args) == 1: return f"pyRange({args[0]})"
@@ -889,7 +908,8 @@ class SwiftEmitter(ast.NodeVisitor):
                 mode = args[1] if len(args) > 1 else ".string(\"r\")"
                 for kw in node.keywords:
                     if kw.arg == "mode": mode = self.expr(kw.value)
-                return f"PyFile({args[0] if args else '.string(\"\")'}, mode: {mode})"
+                path = args[0] if args else '.string("")'
+                return f"PyFile({path}, mode: {mode})"
             if name in self.class_names:
                 info = self.class_methods.get(name, {}).get(
                     "__init__", FunctionInfo("__init__", [], {})
@@ -957,9 +977,11 @@ class SwiftEmitter(ast.NodeVisitor):
             if recv_kind == "file" and method == "write": return f"{recv_expr}.write({self.one_arg(node, method)})"
             if recv_kind.startswith("class:"):
                 class_name = recv_kind.split(":", 1)[1]
-                info = self.class_methods.get(class_name, {}).get(method)
-                if info is not None:
-                    rendered = self.render_known_args(f"{class_name}.{method}", info, node)
+                method_info = self.class_methods.get(class_name, {}).get(method)
+                if method_info is not None:
+                    rendered = self.render_known_args(
+                        f"{class_name}.{method}", method_info, node
+                    )
                     return f"{recv_expr}.{method}({rendered})"
             # Unknown methods cannot safely discard Python keyword arguments.
             if node.keywords:
@@ -1033,7 +1055,9 @@ class SwiftEmitter(ast.NodeVisitor):
             self.error(node, "Only single-generator list comprehensions with a simple name target are supported")
             return ".list([])"
         gen = node.generators[0]
-        name = gen.target.id
+        target = gen.target
+        assert isinstance(target, ast.Name)
+        name = target.id
         condition = " && ".join(f"{self.expr(c)}.truthy" for c in gen.ifs) or "true"
         return f".list(pyIterable({self.expr(gen.iter)}).compactMap {{ {name} in {condition} ? {self.expr(node.elt)} : nil }})"
 
@@ -1127,9 +1151,13 @@ class SwiftEmitter(ast.NodeVisitor):
     def collect_self_attributes(self, node: ast.ClassDef) -> set[str]:
         attrs: set[str] = set()
         for child in ast.walk(node):
-            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name) and child.value.id == "self":
-                if isinstance(child.ctx, (ast.Store, ast.Load)):
-                    attrs.add(child.attr)
+            if (
+                isinstance(child, ast.Attribute)
+                and isinstance(child.value, ast.Name)
+                and child.value.id == "self"
+                and isinstance(child.ctx, (ast.Store, ast.Load))
+            ):
+                attrs.add(child.attr)
         return attrs
 
 

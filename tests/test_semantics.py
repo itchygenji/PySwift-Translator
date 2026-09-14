@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,7 @@ def compile_and_run_swift(source: str, tmp_path: Path, *, timeout: int = 30) -> 
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=timeout,
     )
     return subprocess.run(
@@ -31,21 +33,35 @@ def compile_and_run_swift(source: str, tmp_path: Path, *, timeout: int = 30) -> 
         check=True,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=timeout,
         cwd=tmp_path,
     )
 
 
-def run_python(source: str, tmp_path: Path, *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
-    source_file = tmp_path / "program.py"
-    source_file.write_text(source, encoding="utf-8")
+def run_python(
+    source: str,
+    tmp_path: Path,
+    *,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+
+    program = tmp_path / "program.py"
+    program.write_text(source, encoding="utf-8")
+
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+
     return subprocess.run(
-        [sys.executable, str(source_file)],
-        check=True,
+        [sys.executable, str(program)],
+        cwd=tmp_path,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        env=env,
         timeout=timeout,
-        cwd=tmp_path,
+        check=True,
     )
 
 

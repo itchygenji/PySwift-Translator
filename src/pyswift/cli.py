@@ -48,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
             if not shutil.which("swift"):
                 print("pyswift: Swift toolchain not found on PATH", file=sys.stderr)
                 return 3
-            completed = subprocess.run(["swift", "build"], cwd=output_dir)
+            completed = subprocess.run(["swift", "build"], cwd=output_dir, check=False)
             return completed.returncode
         return 0
 
